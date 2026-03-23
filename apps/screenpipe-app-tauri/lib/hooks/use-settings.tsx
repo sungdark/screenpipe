@@ -308,7 +308,7 @@ let DEFAULT_SETTINGS: Settings = {
 			cloudArchiveRetentionDays: 7,
 			filterMusic: false,
 			ignoreIncognitoWindows: true,
-			pauseOnDrmContent: false,
+			pauseOnDrmContent: true,
 		};
 
 export function createDefaultSettingsObject(): Settings {
