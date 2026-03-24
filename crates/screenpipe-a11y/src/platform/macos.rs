@@ -374,6 +374,12 @@ fn run_event_tap(
 
     rl.remove_src(&src, cf::RunLoopMode::default());
     debug!("Event tap stopped");
+
+    // Clean up the intentionally leaked state_box now that the run loop
+    // has stopped and the callback will no longer be invoked.
+    unsafe {
+        let _ = Box::from_raw(state_ptr);
+    }
 }
 
 extern "C" fn tap_callback(
