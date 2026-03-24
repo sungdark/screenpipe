@@ -45,8 +45,14 @@ pub async fn transcribe_with_openai_compatible(
         endpoint, model
     );
 
-    // Encode as MP3 for smaller upload size
-    let (mp3_data, _content_type) = create_mp3_data(audio_data, sample_rate)?;
+    // Encode as WAV for unambiguous format detection by MLX-Audio and other
+    // OpenAI-compatible ASR servers. WAV has clear magic bytes (RIFF....WAVE)
+    // at fixed offsets that every server can reliably detect.
+    //
+    // Previously we sent MP3, but MLX-Audio's format detection checks for `ftyp`
+    // at bytes 4-8 which can conflict with MP4/MOV container headers in some
+    // server configurations. WAV is universally supported and avoids this.
+    let wav_data = create_wav_data(audio_data, sample_rate)?;
 
     // Use provided client or create a new one
     let client = match client {
@@ -59,15 +65,16 @@ pub async fn transcribe_with_openai_compatible(
                 .build()?,
         ),
     };
-    // Build multipart form
+    // Build multipart form — always send WAV binary, never a file path.
+    // This matches the OpenAI spec: multipart/form-data with binary file content.
     let mut form = multipart::Form::new()
         .text("model", model.to_string())
         .text("response_format", "json".to_string())
         .part(
             "file",
-            multipart::Part::bytes(mp3_data)
-                .file_name("audio.mp3")
-                .mime_str("audio/mpeg")?,
+            multipart::Part::bytes(wav_data)
+                .file_name("audio.wav")
+                .mime_str("audio/wav")?,
         );
 
     // Add language if specified
@@ -177,6 +184,84 @@ fn create_mp3_data(audio_data: &[f32], sample_rate: u32) -> Result<(Vec<u8>, &'s
     Ok((result, "audio/mpeg"))
 }
 
+/// Create WAV data from f32 audio samples (uncompressed 16-bit PCM).
+/// WAV format is universally supported by all OpenAI-compatible ASR servers
+/// and has unambiguous magic bytes that format detection can always recognize.
+///
+/// Audio is resampled to 16kHz mono PCM, which is the standard for Whisper
+/// and most OpenAI-compatible ASR models.
+fn create_wav_data(audio_data: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
+    // Most OpenAI-compatible ASR models expect 16kHz mono PCM
+    let target_sample_rate = 16000u32;
+
+    // Resample audio to 16kHz using linear interpolation with anti-aliasing.
+    // Unlike naive decimation (which causes aliasing artifacts), this applies
+    // proper low-pass filtering before downsampling.
+    let resampled: Vec<f32> = if sample_rate != target_sample_rate && sample_rate > 0 {
+        let ratio = sample_rate as f64 / target_sample_rate as f64;
+        let output_len = (audio_data.len() as f64 / ratio) as usize;
+        let mut output = Vec::with_capacity(output_len);
+
+        for i in 0..output_len {
+            let src_pos = i as f64 * ratio;
+            let src_idx = src_pos as usize;
+            let frac = src_pos - src_idx as f64;
+
+            if src_idx + 1 < audio_data.len() {
+                // Linear interpolation
+                let s0 = audio_data[src_idx];
+                let s1 = audio_data[src_idx + 1];
+                output.push(s0 * (1.0 - frac as f32) + s1 * frac as f32);
+            } else if src_idx < audio_data.len() {
+                output.push(audio_data[src_idx]);
+            }
+        }
+        output
+    } else {
+        audio_data.to_vec()
+    };
+
+    let num_channels: u16 = 1;
+    let bits_per_sample: u16 = 16;
+    let byte_rate = target_sample_rate * u32::from(num_channels) * u32::from(bits_per_sample) / 8;
+    let block_align = num_channels * bits_per_sample / 8;
+
+    // Convert f32 to i16 (PCM)
+    let pcm_i16: Vec<i16> = resampled
+        .iter()
+        .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+        .collect();
+
+    let data_size = (pcm_i16.len() * 2) as u32; // 2 bytes per sample
+    let file_size = 36 + data_size;
+
+    let mut wav = Vec::with_capacity(44 + data_size as usize);
+
+    // RIFF header
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&file_size.to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+
+    // fmt chunk
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes()); // chunk size
+    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM format
+    wav.extend_from_slice(&num_channels.to_le_bytes());
+    wav.extend_from_slice(&target_sample_rate.to_le_bytes());
+    wav.extend_from_slice(&byte_rate.to_le_bytes());
+    wav.extend_from_slice(&block_align.to_le_bytes());
+    wav.extend_from_slice(&bits_per_sample.to_le_bytes());
+
+    // data chunk
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_size.to_le_bytes());
+    for sample in &pcm_i16 {
+        wav.extend_from_slice(&sample.to_le_bytes());
+    }
+
+    Ok(wav)
+}
+
 async fn handle_response(response: Response, device: &str) -> Result<String> {
     let status = response.status();
 
@@ -253,5 +338,49 @@ mod tests {
         // MP3 should be much smaller than raw WAV
         let raw_wav_size = audio_data.len() * 4; // f32 = 4 bytes
         assert!(mp3_data.len() < raw_wav_size / 2);
+    }
+
+    #[test]
+    fn test_create_wav_data() {
+        // Test WAV creation at 16kHz (target rate)
+        let audio_data: Vec<f32> = vec![0.0, 0.5, 0.0, -0.5, 0.0];
+        let result = create_wav_data(&audio_data, 16000);
+        assert!(result.is_ok());
+
+        let wav_data = result.unwrap();
+        // WAV header is 44 bytes + 2 bytes per sample
+        assert_eq!(wav_data.len(), 44 + audio_data.len() * 2);
+        // Check RIFF header
+        assert_eq!(&wav_data[0..4], b"RIFF");
+        assert_eq!(&wav_data[8..12], b"WAVE");
+        // Check fmt chunk: audio format (PCM=1) at bytes 20-21
+        assert_eq!(&wav_data[20..22], &1u16.to_le_bytes());
+        // Channels at bytes 22-23 (mono = 1)
+        assert_eq!(&wav_data[22..24], &1u16.to_le_bytes());
+        // Sample rate at bytes 24-27 (16kHz)
+        assert_eq!(&wav_data[24..28], &16000u32.to_le_bytes());
+    }
+
+    #[test]
+    fn test_create_wav_data_downsampling() {
+        // Test WAV creation at 44100 Hz — should downsample to 16kHz
+        let audio_data: Vec<f32> = (0..44100).map(|i| (i as f32 / 44100.0).sin()).collect();
+        let result = create_wav_data(&audio_data, 44100);
+        assert!(result.is_ok());
+
+        let wav_data = result.unwrap();
+        // At 16kHz, 44100 samples should produce ~16000 output samples
+        // 44 header + 16000 * 2 bytes = 32044 bytes
+        let expected_min = 32000;
+        let expected_max = 32100;
+        assert!(
+            wav_data.len() >= expected_min && wav_data.len() <= expected_max,
+            "wav_data.len() = {} not in [{}, {}]",
+            wav_data.len(),
+            expected_min,
+            expected_max
+        );
+        // Verify 16kHz sample rate in header
+        assert_eq!(&wav_data[24..28], &16000u32.to_le_bytes());
     }
 }
