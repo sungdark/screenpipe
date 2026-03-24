@@ -280,7 +280,13 @@ fn run_event_tap(
             | cg::EventType::RIGHT_MOUSE_DRAGGED.mask();
     }
 
-    let state = Box::leak(Box::new(TapState {
+    // Allocate TapState as a Box. We intentionally leak it (via std::mem::forget)
+    // so that the raw pointer passed to the C callback remains valid for the
+    // duration of the run loop. We add explicit Box::from_raw cleanup in every
+    // exit path so the memory is reclaimed when the recording session ends.
+    // This replaces the prior unconditional Box::leak which permanently leaked
+    // TapState and all its cidre/ObjC sub-objects for the life of the process.
+    let state_box = Box::new(TapState {
         tx,
         start,
         config: config.clone(),
@@ -289,7 +295,17 @@ fn run_event_tap(
         current_app,
         current_window,
         activity_feed,
-    }));
+    });
+    let state_ptr = Box::into_raw(state_box);
+    // Prevent the Box from being auto-dropped (which would free the memory
+    // while the C callback still holds state_ptr). We manage deallocation
+    // explicitly via Box::from_raw in every exit path below.
+    std::mem::forget(state_box);
+    // SAFETY: the raw pointer is valid for the lifetime of state_box, which
+    // we manage explicitly. The callback only dereferences it while the run
+    // loop is alive.
+    #[allow(clippy::mut_from_ref)]
+    let state: &mut TapState = unsafe { &mut *(state_ptr) };
 
     let tap = cg::EventTap::new(
         cg::EventTapLocation::Session,
@@ -302,11 +318,21 @@ fn run_event_tap(
 
     let Some(tap) = tap else {
         error!("Failed to create CGEventTap");
+        // Clean up the intentionally leaked state_box before returning.
+        // The callback was never registered with the system, so state is safe to free.
+        unsafe {
+            let _ = Box::from_raw(state_ptr);
+        }
         return;
     };
 
     let Some(src) = cf::MachPort::run_loop_src(&tap, 0) else {
         error!("Failed to create run loop source");
+        // Clean up the intentionally leaked state_box before returning.
+        // The run loop hasn't started yet, so the callback cannot be invoked.
+        unsafe {
+            let _ = Box::from_raw(state_ptr);
+        }
         return;
     };
 
